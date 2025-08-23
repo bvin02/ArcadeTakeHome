@@ -76,3 +76,192 @@ class Store:
         """
         self.conn.execute("DELETE FROM arcade_store WHERE key = ?",
                           (key,))
+
+    # --- session management ---
+    def new_session(self):
+        """
+        Create a new client session.
+
+        Returns:
+            Session: A session object that buffers reads/writes and supports
+            nested transactions (BEGIN/COMMIT/ROLLBACK). Use this when you want
+            to group multiple operations atomically or layer changes before
+            flushing them to the database.
+        """
+        return Session(self)
+    
+
+class Session:
+    """
+    Per-client session with its own stack of nested transactions.
+
+    The session keeps an in-memory stack of layers. Each layer holds:
+      - `writes` (dict): keys and their pending values for this layer.
+      - `deleted` (set): keys marked for deletion in this layer.
+
+    Reads consult the stack from top to bottom before falling back to the DB.
+    Writes/deletes go to the top layer when inside a transaction; otherwise
+    they are applied immediately to the database (autocommit mode).
+
+    Use:
+        s = store.new_session()
+        s.begin()
+        s.set("k", 1)
+        s.begin()
+        s.set("k", 2)
+        s.rollback()  # back to value 1 in the outer tx
+        s.commit()    # flushes to DB
+    """
+
+    def __init__(self, store):
+        """
+        Initialize a session tied to a Store.
+
+        Args:
+            store (Store): The backing store that owns the SQLite connection.
+        """
+        self.store = store
+        self._stack = []
+
+    # --- Transaction control ---
+    def begin(self):
+        """
+        Start a new (possibly nested) transaction layer.
+
+        Notes:
+            - Changes made after `begin()` are isolated in this layer until a
+              matching `commit()` merges them or a `rollback()` discards them.
+            - Layers can be nested arbitrarily; only the outermost commit
+              touches the database.
+        """
+        self._stack.append(({}, set()))
+
+    def commit(self):
+        """
+        Commit the current transaction layer.
+
+        Behavior:
+            - If there is a parent layer, merge this layer's pending writes and
+              deletions into the parent without touching the database.
+            - If this is the outermost layer, apply all pending writes/deletes
+              to the database atomically in a single SQLite transaction.
+
+        Raises:
+            RuntimeError: If there is no active transaction to commit.
+        """
+        if not self._stack:
+            raise RuntimeError("No active transaction to commit")
+        top_writes, top_deleted = self._stack.pop()
+
+        if self._stack:
+            # Merge into parent layer
+            parent_writes, parent_deleted = self._stack[-1]
+            # Apply deletions to parent
+            for k in top_deleted:
+                parent_deleted.add(k)
+                if k in parent_writes:
+                    del parent_writes[k]
+            # Apply writes to parent
+            for k, v in top_writes.items():
+                parent_writes[k] = v
+                if k in parent_deleted:
+                    parent_deleted.remove(k)
+            return
+
+        # Outermost: flush to DB atomically
+        conn = self.store.conn
+        try:
+            conn.execute("BEGIN;")
+            for k in top_deleted:
+                self.store._db_delete(k)
+            for k, v in top_writes.items():
+                self.store._db_set(k, v)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def rollback(self):
+        """
+        Discard the current transaction layer without applying changes.
+
+        Raises:
+            RuntimeError: If there is no active transaction to roll back.
+        """
+        if not self._stack:
+            raise RuntimeError("No active transaction to rollback")
+        self._stack.pop()
+
+    # --- Data operations (session-aware) ---
+    def set(self, key, value):
+        """
+        Set (create or update) a key to a value.
+
+        Args:
+            key (str): The key to set.
+            value (Any): The value to associate with the key.
+
+        Notes:
+            - Inside a transaction layer, the change is buffered until commit.
+            - With no active transaction, the write is autocommitted to the DB.
+        """
+        if not self._stack:
+            # autocommit
+            self.store._db_set(key, value)
+            self.store.conn.commit()
+            return
+        writes, deleted = self._stack[-1]
+        writes[key] = value
+        if key in deleted:
+            deleted.remove(key)
+
+    def get(self, key):
+        """
+        Get the current value for a key, considering uncommitted changes.
+
+        Args:
+            key (str): The key to look up.
+
+        Returns:
+            Any | None: The value if present (including from pending writes),
+            or None if deleted in any active layer or absent from the database.
+        """
+        # Search from top layer down
+        for writes, deleted in reversed(self._stack):
+            if key in deleted:
+                return None
+            if key in writes:
+                return writes[key]
+        # Fallback to DB
+        return self.store._db_get(key)
+
+    def delete(self, key):
+        """
+        Mark a key as deleted (or delete immediately with autocommit).
+
+        Args:
+            key (str): The key to delete.
+
+        Notes:
+            - Inside a transaction, the deletion is recorded in the top layer
+              and will take effect on commit.
+            - With no active transaction, the deletion is autocommitted.
+        """
+        if not self._stack:
+            self.store._db_delete(key)
+            self.store.conn.commit()
+            return
+        writes, deleted = self._stack[-1]
+        deleted.add(key)
+        if key in writes:
+            del writes[key]
+    
+    # --- Utility ---
+    def depth(self):
+        """
+        Return the current transaction nesting depth.
+
+        Returns:
+            int: Number of active transaction layers (0 means autocommit mode).
+        """
+        return len(self._stack)
