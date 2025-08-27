@@ -3,12 +3,13 @@ import time
 import sqlite3
 import json
 import threading
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 class Store:
     """Holds the shared SQLite connection and provides helpers to access the DB."""
 
-    def __init__(self, db_path=":memory:"):
+    def __init__(self, db_path: str = ":memory:") -> None:
         """
         Initialize the Store with an throwaway SQLite connection.
 
@@ -23,11 +24,11 @@ class Store:
                 - key   (TEXT, PRIMARY KEY)
                 - value (TEXT)
         """
-        self.log_path = "store_commits.txt"
-        self._log_lock = threading.Lock()
+        self.log_path: str = "logs/store_commits.txt"
+        self._log_lock: threading.Lock = threading.Lock()
 
-        self.db_path = db_path
-        self._tls = threading.local()
+        self.db_path: str = db_path
+        self._tls: threading.local = threading.local()
 
         init = sqlite3.connect(self.db_path, check_same_thread=False)
         # one-time init on a throwaway connection to create schema
@@ -41,7 +42,7 @@ class Store:
         finally:
             init.close()
 
-    def _get_conn(self):
+    def _get_conn(self) -> sqlite3.Connection:
         """Return this thread's connection; creating it on first use."""
         conn = getattr(self._tls, "conn", None)
         if conn is None:
@@ -54,7 +55,7 @@ class Store:
         return conn
     
     # -- logging operations ---
-    def _append_log(self, *, commit_type, writes, deletes):
+    def _append_log(self, *, commit_type, writes, deletes) -> None:
         record = {
             "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "thread": threading.current_thread().name,
@@ -67,7 +68,7 @@ class Store:
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
     
-    def print_log(self):
+    def print_log(self) -> str:
         """Return the entire commit log as plain text."""
         try:
             with open(self.log_path, "r", encoding="utf-8") as f:
@@ -76,7 +77,7 @@ class Store:
             return ""
 
     # --- db operations via SQL queries ---
-    def _db_get(self, key):
+    def _db_get(self, key: str) -> Optional[Any]:
         """
         Retrieve a value from the database by its key.
 
@@ -96,7 +97,7 @@ class Store:
             return None
         return json.loads(result[0])
 
-    def _db_set(self, key, value):
+    def _db_set(self, key: str, value: Any) -> None:
         """
         Insert or update a key-value pair in the database.
 
@@ -114,7 +115,7 @@ class Store:
             (key, deserialized_value),
         )
 
-    def _db_delete(self, key):
+    def _db_delete(self, key: str) -> None:
         """
         Delete a key-value pair from the database.
 
@@ -130,7 +131,7 @@ class Store:
             (key,))
 
     # --- session management ---
-    def new_session(self):
+    def new_session(self) -> "Session":
         """
         Create a new client session.
 
@@ -143,7 +144,7 @@ class Store:
         return Session(self)
     
     # --- dump entire committed db ---
-    def print_db(self):
+    def print_db(self) -> List[Tuple[str, Any]]:
         """
         Return ALL committed (key, value) rows from the database.
         """
@@ -174,7 +175,7 @@ class Session:
         s.commit()    # flushes to DB
     """
 
-    def __init__(self, store):
+    def __init__(self, store: Store) -> None:
         """
         Initialize a session tied to a Store.
 
@@ -182,10 +183,10 @@ class Session:
             store (Store): The backing store that owns the SQLite connection.
         """
         self.store = store
-        self._stack = []
+        self._stack: List[Tuple[Dict[str, Any], Set[str]]] = []
 
     # --- Transaction control ---
-    def begin(self):
+    def begin(self) -> None:
         """
         Start a new (possibly nested) transaction layer.
 
@@ -197,7 +198,7 @@ class Session:
         """
         self._stack.append(({}, set()))
 
-    def commit(self):
+    def commit(self) -> None:
         """
         Commit the current transaction layer.
 
@@ -248,7 +249,7 @@ class Session:
             deletes=list(top_deleted),
         )
 
-    def rollback(self):
+    def rollback(self) -> None:
         """
         Discard the current transaction layer without applying changes.
 
@@ -260,7 +261,7 @@ class Session:
         self._stack.pop()
 
     # --- Data operations (session-aware) ---
-    def set(self, key, value):
+    def set(self, key: str, value: Any) -> None:
         """
         Set (create or update) a key to a value.
 
@@ -288,7 +289,7 @@ class Session:
         if key in deleted:
             deleted.remove(key)
 
-    def get(self, key):
+    def get(self, key: str) -> Optional[Any]:
         """
         Get the current value for a key, considering uncommitted changes.
 
@@ -308,7 +309,7 @@ class Session:
         # Fallback to DB
         return self.store._db_get(key)
 
-    def delete(self, key):
+    def delete(self, key: str) -> None:
         """
         Mark a key as deleted (or delete immediately with autocommit).
 
@@ -336,7 +337,7 @@ class Session:
             del writes[key]
     
     # --- Utility ---
-    def depth(self):
+    def depth(self) -> int:
         """
         Return the current transaction nesting depth.
 
