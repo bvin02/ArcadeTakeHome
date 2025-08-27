@@ -1,5 +1,5 @@
 import uuid, os
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify, abort, Response
 from arcade_store.store import Store
 
 """
@@ -119,6 +119,13 @@ def create_app(db_path=None):
             abort(403, description="db dump disabled server")
         items = store.print_db()
         return jsonify([{"key": k, "value": v} for (k, v) in items])
+    
+    ENABLE_STORE_LOG = os.getenv("ENABLE_STORE_LOG", "0") == "1"
+    @app.get("/_debug/commit_log.txt")
+    def print_log():
+        if not ENABLE_STORE_LOG:
+            abort(403, description="commit log disabled server")
+        return Response(store.print_log(), mimetype="text/plain")
     
     return app
 

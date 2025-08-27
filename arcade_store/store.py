@@ -1,3 +1,5 @@
+import os
+import time
 import sqlite3
 import json
 import threading
@@ -21,8 +23,12 @@ class Store:
                 - key   (TEXT, PRIMARY KEY)
                 - value (TEXT)
         """
+        self.log_path = "store_commits.txt"
+        self._log_lock = threading.Lock()
+
         self.db_path = db_path
         self._tls = threading.local()
+
         init = sqlite3.connect(self.db_path, check_same_thread=False)
         # one-time init on a throwaway connection to create schema
         try:
@@ -46,6 +52,28 @@ class Store:
             conn.execute("PRAGMA synchronous=NORMAL;")
             self._tls.conn = conn
         return conn
+    
+    # -- logging operations ---
+    def _append_log(self, *, commit_type, writes, deletes):
+        record = {
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "thread": threading.current_thread().name,
+            "type": commit_type,           # "transaction" or "autocommit"
+            "writes": writes,
+            "deletes": sorted(deletes)
+        }
+        line = json.dumps(record, separators=(",", ":"))
+        with self._log_lock:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    
+    def print_log(self):
+        """Return the entire commit log as plain text."""
+        try:
+            with open(self.log_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
 
     # --- db operations via SQL queries ---
     def _db_get(self, key):
@@ -213,6 +241,12 @@ class Session:
         except Exception:
             conn.rollback()
             raise
+        
+        self.store._append_log(
+            commit_type="transaction",
+            writes=top_writes,
+            deletes=list(top_deleted),
+        )
 
     def rollback(self):
         """
@@ -243,6 +277,11 @@ class Session:
             conn = self.store._get_conn()
             self.store._db_set(key, value)
             conn.commit()
+            self.store._append_log(
+                commit_type="autocommit",
+                writes={key: value},
+                deletes=[]
+            )
             return
         writes, deleted = self._stack[-1]
         writes[key] = value
@@ -285,6 +324,11 @@ class Session:
             conn = self.store._get_conn()
             self.store._db_delete(key)
             conn.commit()
+            self.store._append_log(
+                commit_type="autocommit",
+                writes={},
+                deletes=[key]
+            )
             return
         writes, deleted = self._stack[-1]
         deleted.add(key)

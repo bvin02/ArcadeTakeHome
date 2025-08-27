@@ -8,7 +8,7 @@ A transactional key-value store with nested transactions, a Flask REST API, and 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pytest -q
-ENABLE_STORE_DUMP=1 python api.py
+ENABLE_STORE_DUMP=1 ENABLE_STORE_LOG=1 python api.py
 ```
 
 ## API
@@ -29,14 +29,17 @@ ENABLE_STORE_DUMP=1 python api.py
 * A **web API** (HTTP endpoints) exposes `GET`, `PUT`, `DELETE`, and transaction controls.
 * Backed by **SQLite** (a local .sqlite file). Values are serialized as JSON text.
 
-## Sample usage of the key-value store 
+---
+## Sample usage of the key-value store (via API with curl) 
+---
 
 **Tip**: install jq to pretty-print JSON (brew install jq on macOS). It’s optional 
 
 ### 0) Start the API server in one terminal
 ```bash
-ENABLE_STORE_DUMP=1 python api.py
-# ENABLE_STORE_DUMP env var allows client side to print the entire committed db
+ENABLE_STORE_DUMP=1 ENABLE_STORE_LOG=1 python api.py
+# ENABLE_STORE_DUMP enables GET /store (full committed DB dump)
+# ENABLE_STORE_LOG enables GET /_debug/commit_log.txt (commit log view)
 ```
 
 ### 1) Create a client Session in another terminal window and begin a transaction
@@ -112,4 +115,58 @@ curl -s -X PUT "http://localhost:8000/store/config:theme" \
 
 curl -s -X GET "http://localhost:8000/store/config:theme" | jq
 curl -s -X GET "http://localhost:8000/store" | jq
+```
+
+### 6) Nested transactions
+Begin outer tx:
+```bash
+curl -s -X POST http://localhost:8000/session/$SID/begin | jq
+# → {"ok":true,"depth":1}
+
+# stage a change in outer tx
+curl -s -X PUT "http://localhost:8000/store/nested:key" \
+  -H "Content-Type: application/json" -H "X-Session-ID: $SID" \
+  -d '{"value":"outer"}' | jq
+
+# Read WITHIN the session (sees staged "outer")
+curl -s -X GET "http://localhost:8000/store/nested:key" -H "X-Session-ID: $SID" | jq
+
+# Read WITHOUT the session (404)
+curl -s -X GET "http://localhost:8000/store/nested:key" | jq
+```
+Begin inner transaction:
+```bash
+# override key
+curl -s -X POST http://localhost:8000/session/$SID/begin | jq # → {"ok":true,"depth":2}
+
+curl -s -X PUT "http://localhost:8000/store/nested:key" \
+  -H "Content-Type: application/json" -H "X-Session-ID: $SID" \
+  -d '{"value":"inner"}' | jq
+
+# Inside session → shows inner value
+curl -s -X GET "http://localhost:8000/store/nested:key" -H "X-Session-ID: $SID" | jq
+# → {"key":"nested:key","value":"inner","found":true}
+```
+Merge inner transaction:
+```bash
+curl -s -X POST http://localhost:8000/session/$SID/commit | jq
+# → {"ok":true,"depth":1}
+
+# Still only visible IN session
+curl -s -X GET "http://localhost:8000/store/nested:key" -H "X-Session-ID: $SID" | jq # → {"key":"nested:key","value":"inner","found":true}
+curl -s -X GET "http://localhost:8000/store/nested:key" | jq # 404
+```
+Rollback outer transaction:
+```bash
+curl -s -X POST http://localhost:8000/session/$SID/rollback | jq
+# → {"ok":true,"depth":0}
+
+# Gone everywhere
+curl -s -X GET "http://localhost:8000/store/nested:key" -H "X-Session-ID: $SID" | jq
+curl -s -X GET "http://localhost:8000/store/nested:key" | jq
+```
+
+### 7) View commit log (if logging enabled)
+```bash
+curl -s http://localhost:8000/_debug/commit_log.txt
 ```
