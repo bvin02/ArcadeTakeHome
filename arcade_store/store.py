@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import threading
 
 
 class Store:
@@ -7,7 +8,7 @@ class Store:
 
     def __init__(self, db_path=":memory:"):
         """
-        Initialize the Store with an SQLite connection.
+        Initialize the Store with an throwaway SQLite connection.
 
         Args:
             db_path (str, optional): Path to the SQLite database file.
@@ -21,12 +22,30 @@ class Store:
                 - value (TEXT)
         """
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS arcade_store (key TEXT PRIMARY KEY, value TEXT)"
-        )
-        self.conn.commit()
+        self._tls = threading.local()
+        init = sqlite3.connect(self.db_path, check_same_thread=False)
+        # one-time init on a throwaway connection to create schema
+        try:
+            init.execute("PRAGMA journal_mode=WAL;")     # enables readers during writes
+            init.execute("PRAGMA busy_timeout=3000;")    # wait up to 3s on locks
+            init.execute(
+                "CREATE TABLE IF NOT EXISTS arcade_store (key TEXT PRIMARY KEY, value TEXT)"
+            )
+            init.commit()
+        finally:
+            init.close()
+
+    def _get_conn(self):
+        """Return this thread's connection; creating it on first use."""
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            # Re-apply pragmas on each new connection (journal_mode is db-level, others are per-conn)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=3000;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            self._tls.conn = conn
+        return conn
 
     # --- db operations via SQL queries ---
     def _db_get(self, key):
@@ -40,8 +59,10 @@ class Store:
             Any | None: The deserialized value associated with the key,
             or None if the key does not exist.
         """
-        query = self.conn.execute("SELECT value FROM arcade_store WHERE key = ?",
-                                  (key,))
+        conn = self._get_conn()
+        query = conn.execute(
+                    "SELECT value FROM arcade_store WHERE key = ?",
+                    (key,))
         result = query.fetchone()
         if result is None:
             return None
@@ -58,8 +79,9 @@ class Store:
         Notes:
             - If the key already exists, its value is updated (upsert).
         """
+        conn = self._get_conn()
         deserialized_value = json.dumps(value, separators=(",", ":"))
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO arcade_store(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, deserialized_value),
         )
@@ -74,8 +96,10 @@ class Store:
         Returns:
             None
         """
-        self.conn.execute("DELETE FROM arcade_store WHERE key = ?",
-                          (key,))
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM arcade_store WHERE key = ?",
+            (key,))
 
     # --- session management ---
     def new_session(self):
@@ -168,8 +192,8 @@ class Session:
                     parent_deleted.remove(k)
             return
 
-        # Outermost: flush to DB atomically
-        conn = self.store.conn
+        # Outermost: flush to DB atomically on a separate thread's connection
+        conn = self.store._get_conn() 
         try:
             conn.execute("BEGIN;")
             for k in top_deleted:
@@ -207,8 +231,9 @@ class Session:
         """
         if not self._stack:
             # autocommit
+            conn = self.store._get_conn()
             self.store._db_set(key, value)
-            self.store.conn.commit()
+            conn.commit()
             return
         writes, deleted = self._stack[-1]
         writes[key] = value
@@ -248,8 +273,9 @@ class Session:
             - With no active transaction, the deletion is autocommitted.
         """
         if not self._stack:
+            conn = self.store._get_conn()
             self.store._db_delete(key)
-            self.store.conn.commit()
+            conn.commit()
             return
         writes, deleted = self._stack[-1]
         deleted.add(key)
