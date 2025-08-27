@@ -111,6 +111,15 @@ def create_app(db_path=None):
         s.delete(key)
         return jsonify({"ok": True})
     
+    ENABLE_STORE_DUMP = os.getenv("ENABLE_STORE_DUMP", "0") == "1"
+    @app.get("/store")
+    def print_db():
+        """Dump the full committed DB as a list of {key, value} objects."""
+        if not ENABLE_STORE_DUMP:
+            abort(403, description="db dump disabled server")
+        items = store.print_db()
+        return jsonify([{"key": k, "value": v} for (k, v) in items])
+    
     return app
 
 if __name__ == "__main__":

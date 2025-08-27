@@ -114,6 +114,15 @@ class Store:
         """
         return Session(self)
     
+    # --- dump entire committed db ---
+    def print_db(self):
+        """
+        Return ALL committed (key, value) rows from the database.
+        """
+        conn = self._get_conn()
+        db = conn.execute("SELECT key, value FROM arcade_store ORDER BY key").fetchall()
+        return [(k, json.loads(v)) for (k, v) in db] 
+    
 
 class Session:
     """

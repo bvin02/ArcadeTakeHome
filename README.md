@@ -8,8 +8,8 @@ A transactional key-value store with nested transactions, a Flask REST API, and 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pytest -q
-python api.py  # http://localhost:8000
-````
+ENABLE_STORE_DUMP=1 python api.py
+```
 
 ## API
 
